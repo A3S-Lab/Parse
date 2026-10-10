@@ -1,4 +1,5 @@
 mod html;
+mod map;
 mod office;
 pub(crate) mod pdf;
 mod text;
@@ -51,26 +52,28 @@ pub(crate) fn resolve_media_type(
         (Some(_), Some(_)) => Err(ParseError::InvalidRequest(
             "media type does not match the file bytes".into(),
         )),
-        (Some(declared), None) if is_text(declared) && is_utf8_text(bytes) => Ok(declared.to_string()),
+        (Some(declared), None) if is_text(declared) && is_utf8_text(bytes) => {
+            Ok(declared.to_string())
+        }
         (Some(declared), None) if expects_signature(declared) => Err(ParseError::InvalidRequest(
             "media type does not match the file bytes".into(),
         )),
         (Some(declared), None) => Err(ParseError::UnsupportedType(declared.to_string())),
         (None, None) if is_utf8_text(bytes) => Ok("text/plain".into()),
-        (None, None) => Err(ParseError::UnsupportedType("application/octet-stream".into())),
+        (None, None) => Err(ParseError::UnsupportedType(
+            "application/octet-stream".into(),
+        )),
     }
 }
 
 pub(crate) fn is_image(media: &str) -> bool {
-    matches!(
-        media,
-        "image/png" | "image/jpeg" | "image/webp"
-    )
+    matches!(media, "image/png" | "image/jpeg" | "image/webp")
 }
 
 pub(crate) fn decode(media: &str, bytes: &[u8]) -> Result<RawDocument, ParseError> {
     match media {
         "text/plain" | "text/markdown" | "text/csv" => Ok(text::decode(bytes)),
+        // anydoc 0.2.4 has no HTML format. This scanner stays local.
         "text/html" => Ok(html::decode(bytes)),
         "application/pdf" => pdf::decode(bytes),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -126,7 +129,10 @@ fn expects_signature(media: &str) -> bool {
 }
 
 fn is_text(media: &str) -> bool {
-    matches!(media, "text/plain" | "text/markdown" | "text/csv" | "text/html")
+    matches!(
+        media,
+        "text/plain" | "text/markdown" | "text/csv" | "text/html"
+    )
 }
 
 fn is_utf8_text(bytes: &[u8]) -> bool {

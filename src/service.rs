@@ -43,16 +43,16 @@ pub(crate) fn parse_multipart(
     content_type: &str,
     body: &[u8],
 ) -> Result<IncomingParse, ParseReply> {
-    if content_type.to_ascii_lowercase().contains("application/json") {
-        return Err(reply(
-            400,
-            "INVALID_REQUEST",
-            "file must be multipart",
-        ));
+    if content_type
+        .to_ascii_lowercase()
+        .contains("application/json")
+    {
+        return Err(reply(400, "INVALID_REQUEST", "file must be multipart"));
     }
     let boundary = content_type.split(';').find_map(|part| {
         let (name, value) = part.trim().split_once('=')?;
-        name.eq_ignore_ascii_case("boundary").then(|| value.trim().trim_matches('"').to_string())
+        name.eq_ignore_ascii_case("boundary")
+            .then(|| value.trim().trim_matches('"').to_string())
     });
     let Some(boundary) = boundary else {
         return Err(reply(400, "INVALID_REQUEST", "file must be multipart"));
@@ -82,7 +82,9 @@ pub(crate) fn parse_multipart(
                 }
             }
             "outputs" => {
-                for item in String::from_utf8_lossy(&value).split(|ch: char| ch == ',' || ch.is_whitespace()) {
+                for item in String::from_utf8_lossy(&value)
+                    .split(|ch: char| ch == ',' || ch.is_whitespace())
+                {
                     if item.is_empty() {
                         continue;
                     }
@@ -167,7 +169,9 @@ fn disposition_name(headers: &str) -> Option<String> {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 pub(crate) fn document_json(document: &ParseDocument) -> Value {

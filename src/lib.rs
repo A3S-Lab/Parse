@@ -11,11 +11,11 @@ mod model;
 mod service;
 
 pub use error::ParseError;
+pub use http::serve_native;
 pub use model::{
     restore_x_pt, restore_y_pt, Anchor, AnchorKind, Block, BlockType, OutputKind, PageGeom,
     ParseDocument, ParseMode, ParseRequest,
 };
-pub use http::serve_native;
 
 pub fn parse_document(request: &ParseRequest) -> Result<ParseDocument, ParseError> {
     assemble::parse_document(request)

@@ -15,7 +15,10 @@ pub(crate) fn parse_listen_addr(listen: &str) -> Result<SocketAddr, String> {
         .map_err(|_| format!("listen address must be host:port, got {listen}"))
 }
 
-pub(crate) fn public_bind_requires_key(addr: SocketAddr, api_key: Option<&str>) -> Result<(), String> {
+pub(crate) fn public_bind_requires_key(
+    addr: SocketAddr,
+    api_key: Option<&str>,
+) -> Result<(), String> {
     if addr.ip().is_loopback() || api_key.is_some_and(|key| !key.is_empty()) {
         Ok(())
     } else {
@@ -44,7 +47,10 @@ pub async fn serve_native(listen: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn serve_on(listener: TcpListener, api_key: Option<String>) -> std::io::Result<()> {
+pub(crate) async fn serve_on(
+    listener: TcpListener,
+    api_key: Option<String>,
+) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let api_key = api_key.clone();
@@ -80,7 +86,8 @@ async fn dispatch(received: &Received, api_key: Option<&str>) -> ParseReply {
         },
         ("POST", "/v1/parse") => {
             if let Some(expected) = api_key {
-                if !presented_key(&received.headers).is_some_and(|presented| keys_match(expected, &presented))
+                if !presented_key(&received.headers)
+                    .is_some_and(|presented| keys_match(expected, &presented))
                 {
                     return reply(401, "UNAUTHORIZED", "parse credential was rejected");
                 }
@@ -104,7 +111,8 @@ async fn dispatch(received: &Received, api_key: Option<&str>) -> ParseReply {
 fn header_value(headers: &str, wanted: &str) -> Option<String> {
     headers.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case(wanted).then(|| value.trim().to_string())
+        name.eq_ignore_ascii_case(wanted)
+            .then(|| value.trim().to_string())
     })
 }
 
@@ -215,7 +223,10 @@ async fn read_http(stream: &mut TcpStream) -> std::io::Result<Option<Received>> 
 }
 
 fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n").map(|offset| offset + 4)
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|offset| offset + 4)
 }
 
 async fn write_json(stream: &mut TcpStream, reply: &ParseReply) -> std::io::Result<()> {
@@ -297,7 +308,13 @@ mod tests {
         assert!(png.contains("422"), "{png}");
         assert!(png.contains("NEEDS_OCR"), "{png}");
 
-        let unknown = multipart(&address, "deployment-secret", &[0, 1, 2, 3], "application/octet-stream").await;
+        let unknown = multipart(
+            &address,
+            "deployment-secret",
+            &[0, 1, 2, 3],
+            "application/octet-stream",
+        )
+        .await;
         assert!(unknown.contains("415"), "{unknown}");
         assert!(unknown.contains("UNSUPPORTED_TYPE"), "{unknown}");
 
@@ -307,7 +324,12 @@ mod tests {
         assert!(!text.contains("/tmp"), "{text}");
     }
 
-    async fn multipart(address: &std::net::SocketAddr, key: &str, file: &[u8], media: &str) -> String {
+    async fn multipart(
+        address: &std::net::SocketAddr,
+        key: &str,
+        file: &[u8],
+        media: &str,
+    ) -> String {
         let mut body = format!(
             "--bound\r\nContent-Disposition: form-data; name=\"media_type\"\r\n\r\n{media}\r\n--bound\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n"
         )

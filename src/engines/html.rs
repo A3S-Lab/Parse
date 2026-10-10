@@ -22,8 +22,16 @@ pub(crate) fn decode(bytes: &[u8]) -> RawDocument {
                 .unwrap_or("")
                 .trim_start_matches('/')
                 .to_ascii_lowercase();
-            if matches!(name.as_str(), "p" | "div" | "h1" | "h2" | "h3" | "li" | "br") {
-                flush(&mut blocks, &mut paragraph, &mut index, heading_level(&name));
+            if matches!(
+                name.as_str(),
+                "p" | "div" | "h1" | "h2" | "h3" | "li" | "br"
+            ) {
+                flush(
+                    &mut blocks,
+                    &mut paragraph,
+                    &mut index,
+                    heading_level(&name),
+                );
             }
         } else if !ch.is_control() {
             paragraph.push(ch);

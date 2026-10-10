@@ -1,73 +1,160 @@
+use std::collections::BTreeMap;
+
 use lopdf::{Document, Object, ObjectId};
+use pdf_inspector::{PdfError, TextItem};
 
 use super::{RawBlock, RawDocument, RawPage, RawSpan};
 use crate::error::ParseError;
 use crate::model::{norm_box_from_pdf, Anchor, AnchorKind, BlockType, PageGeom, SpanType};
 
+const SAME_LINE_PT: f32 = 2.0;
+
 pub(crate) fn decode(bytes: &[u8]) -> Result<RawDocument, ParseError> {
-    let document = Document::load_mem(bytes)
-        .map_err(|error| ParseError::Unavailable(format!("pdf could not be read: {error}")))?;
+    let mut info = page_info(bytes);
+    let items = pdf_inspector::extract_text_with_positions_mem(bytes).map_err(map_pdf)?;
+    if info.count == 0 {
+        let max_page = items.iter().map(|item| item.page).max().unwrap_or(0);
+        info.count = max_page;
+        info.sizes = vec![(612.0, 792.0); max_page as usize];
+    }
+    let mut by_page: BTreeMap<u32, Vec<TextItem>> = BTreeMap::new();
+    for item in items {
+        if item.text.is_empty() || item.page == 0 {
+            continue;
+        }
+        by_page.entry(item.page - 1).or_default().push(item);
+    }
+    if by_page.is_empty() {
+        return Err(ParseError::NeedsOcr);
+    }
+    let page_count = info
+        .count
+        .max(by_page.keys().next_back().copied().unwrap_or(0) + 1);
     let mut pages = Vec::new();
     let mut saw_text = false;
-    for (index, (page_number, page_id)) in document.get_pages().into_iter().enumerate() {
-        let page_idx = index as u32;
-        let _ = page_number;
-        let (width, height) = page_box(&document, page_id).unwrap_or((612.0, 792.0));
-        let content = page_content(&document, page_id).unwrap_or_default();
-        let runs = text_runs(&content);
-        let mut blocks = Vec::new();
+    for page_idx in 0..page_count {
+        let (width, height) = info
+            .sizes
+            .get(page_idx as usize)
+            .copied()
+            .unwrap_or((612.0, 792.0));
+        let runs = by_page.remove(&page_idx).unwrap_or_default();
         if runs.is_empty() {
             pages.push(RawPage {
                 page_idx,
                 geom: geom(page_idx, width, height),
                 failure: Some("needs_ocr".into()),
-                blocks,
+                blocks: Vec::new(),
             });
             continue;
         }
         saw_text = true;
-        for run in runs {
-            let digits = run.text.chars().all(|ch| ch.is_ascii_digit());
-            let bbox = norm_box_from_pdf(run.x, run.y, run.x + run.width, run.y + run.height, width, height);
-            let anchor = Anchor {
-                kind: AnchorKind::PageBox,
-                page_idx,
-                bbox,
-                part: None,
-            };
-            let span = RawSpan {
-                text: run.text.clone(),
-                span_type: SpanType::Text,
-                anchors: vec![anchor.clone()],
-                confidence: None,
-            };
-            blocks.push(RawBlock {
-                block_type: if digits { BlockType::PageNumber } else { BlockType::Text },
-                text: run.text,
-                text_level: None,
-                anchors: vec![anchor],
-                unanchored: bbox.is_none(),
-                discarded: digits,
-                table_continue: false,
-                spans: vec![span],
-            });
-        }
         pages.push(RawPage {
             page_idx,
             geom: geom(page_idx, width, height),
             failure: None,
-            blocks,
+            blocks: lines_to_blocks(runs, page_idx, width, height),
         });
     }
     if !saw_text {
         return Err(ParseError::NeedsOcr);
     }
-    let page_count = pages.len() as u32;
     Ok(RawDocument {
-        parser: "pdf-text/1".into(),
+        parser: "pdf-text/2".into(),
         page_count,
         pages,
     })
+}
+
+fn lines_to_blocks(items: Vec<TextItem>, page_idx: u32, width: f64, height: f64) -> Vec<RawBlock> {
+    let mut blocks = Vec::new();
+    for line in group_lines(items) {
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        let mut left = f64::MAX;
+        let mut bottom = f64::MAX;
+        let mut right = f64::MIN;
+        let mut top = f64::MIN;
+        let mut previous_right: Option<f32> = None;
+        for item in &line {
+            if let Some(edge) = previous_right {
+                if item.x > edge + 0.5 {
+                    text.push(' ');
+                }
+            }
+            text.push_str(&item.text);
+            previous_right = Some(item.x + item.width);
+            let x0 = f64::from(item.x);
+            let y0 = f64::from(item.y);
+            let x1 = f64::from(item.x + item.width);
+            let y1 = f64::from(item.y + item.height);
+            left = left.min(x0);
+            bottom = bottom.min(y0);
+            right = right.max(x1);
+            top = top.max(y1);
+            let bbox = norm_box_from_pdf(x0, y0, x1, y1, width, height);
+            spans.push(RawSpan {
+                text: item.text.clone(),
+                span_type: SpanType::Text,
+                anchors: vec![Anchor {
+                    kind: AnchorKind::PageBox,
+                    page_idx,
+                    bbox,
+                    part: None,
+                }],
+                confidence: None,
+            });
+        }
+        let digits = text.chars().all(|ch| ch.is_ascii_digit());
+        let bbox = norm_box_from_pdf(left, bottom, right, top, width, height);
+        blocks.push(RawBlock {
+            block_type: if digits {
+                BlockType::PageNumber
+            } else {
+                BlockType::Text
+            },
+            text,
+            text_level: None,
+            anchors: vec![Anchor {
+                kind: AnchorKind::PageBox,
+                page_idx,
+                bbox,
+                part: None,
+            }],
+            unanchored: bbox.is_none(),
+            discarded: digits,
+            table_continue: false,
+            spans,
+        });
+    }
+    blocks
+}
+
+fn group_lines(mut items: Vec<TextItem>) -> Vec<Vec<TextItem>> {
+    items.sort_by(|left, right| {
+        right
+            .line_y()
+            .total_cmp(&left.line_y())
+            .then(left.x.total_cmp(&right.x))
+    });
+    let mut lines: Vec<Vec<TextItem>> = Vec::new();
+    for item in items {
+        let same_line = lines
+            .last()
+            .and_then(|line| line.first())
+            .is_some_and(|first| (first.line_y() - item.line_y()).abs() <= SAME_LINE_PT);
+        if same_line {
+            if let Some(line) = lines.last_mut() {
+                line.push(item);
+                continue;
+            }
+        }
+        lines.push(vec![item]);
+    }
+    for line in &mut lines {
+        line.sort_by(|left, right| left.x.total_cmp(&right.x));
+    }
+    lines
 }
 
 fn geom(page_idx: u32, width: f64, height: f64) -> PageGeom {
@@ -79,241 +166,25 @@ fn geom(page_idx: u32, width: f64, height: f64) -> PageGeom {
     }
 }
 
-struct Run {
-    text: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+struct PageInfo {
+    count: u32,
+    sizes: Vec<(f64, f64)>,
 }
 
-fn text_runs(content: &[u8]) -> Vec<Run> {
-    let tokens = tokenize(content);
-    let mut runs = Vec::new();
-    let mut stack: Vec<Token> = Vec::new();
-    let mut x = 0.0;
-    let mut y = 0.0;
-    let mut font_size = 12.0;
-    let mut in_text = false;
-    for token in tokens {
-        match token {
-            Token::Op(op) if op == "BT" => {
-                in_text = true;
-                x = 0.0;
-                y = 0.0;
-                stack.clear();
-            }
-            Token::Op(op) if op == "ET" => {
-                in_text = false;
-                stack.clear();
-            }
-            Token::Op(op) if op == "Tm" && in_text => {
-                let nums = numbers(&stack);
-                if nums.len() >= 6 {
-                    x = nums[nums.len() - 2];
-                    y = nums[nums.len() - 1];
-                }
-                stack.clear();
-            }
-            Token::Op(op) if (op == "Td" || op == "TD") && in_text => {
-                let nums = numbers(&stack);
-                if nums.len() >= 2 {
-                    x += nums[nums.len() - 2];
-                    y += nums[nums.len() - 1];
-                }
-                stack.clear();
-            }
-            Token::Op(op) if op == "Tf" && in_text => {
-                if let Some(size) = numbers(&stack).last().copied() {
-                    if size > 0.0 {
-                        font_size = size;
-                    }
-                }
-                stack.clear();
-            }
-            Token::Op(op) if op == "Tj" && in_text => {
-                if let Some(text) = last_string(&stack) {
-                    push_run(&mut runs, text, x, y, font_size);
-                }
-                stack.clear();
-            }
-            Token::Op(op) if op == "TJ" && in_text => {
-                if let Some(Token::Array(items)) = stack.last() {
-                    let text = items.iter().filter_map(token_string).collect::<String>();
-                    if !text.is_empty() {
-                        push_run(&mut runs, text, x, y, font_size);
-                    }
-                }
-                stack.clear();
-            }
-            Token::Op(_) => stack.clear(),
-            other => stack.push(other),
-        }
-    }
-    runs
-}
-
-fn push_run(runs: &mut Vec<Run>, text: String, x: f64, y: f64, font_size: f64) {
-    let width = text.chars().count() as f64 * font_size * 0.5;
-    runs.push(Run {
-        text,
-        x,
-        y,
-        width,
-        height: font_size,
-    });
-}
-
-fn numbers(stack: &[Token]) -> Vec<f64> {
-    stack.iter().filter_map(|token| match token {
-        Token::Num(value) => Some(*value),
-        _ => None,
-    }).collect()
-}
-
-fn last_string(stack: &[Token]) -> Option<String> {
-    stack.iter().rev().find_map(token_string)
-}
-
-fn token_string(token: &Token) -> Option<String> {
-    match token {
-        Token::Str(value) if !value.is_empty() => Some(value.clone()),
-        _ => None,
-    }
-}
-
-#[allow(dead_code)]
-enum Token {
-    Num(f64),
-    Name(String),
-    Str(String),
-    Array(Vec<Token>),
-    Op(String),
-}
-
-fn tokenize(content: &[u8]) -> Vec<Token> {
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < content.len() {
-        if let Some((token, next)) = read_token(content, index) {
-            tokens.push(token);
-            index = next;
-        } else {
-            index += 1;
-        }
-    }
-    tokens
-}
-
-fn read_token(content: &[u8], mut index: usize) -> Option<(Token, usize)> {
-    while index < content.len() && content[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    if index >= content.len() {
-        return None;
-    }
-    match content[index] {
-        b'%' => {
-            while index < content.len() && content[index] != b'\n' {
-                index += 1;
-            }
-            read_token(content, index)
-        }
-        b'(' => read_literal(content, index),
-        b'<' => read_hex_or_dict(content, index),
-        b'[' => read_array(content, index),
-        b'/' => read_name(content, index),
-        b'+' | b'-' | b'.' | b'0'..=b'9' => read_number(content, index),
-        b'a'..=b'z' | b'A'..=b'Z' | b'\'' | b'"' => read_op(content, index),
-        _ => None,
-    }
-}
-
-fn read_literal(content: &[u8], start: usize) -> Option<(Token, usize)> {
-    let mut text = String::new();
-    let mut index = start + 1;
-    while index < content.len() {
-        match content[index] {
-            b')' => return Some((Token::Str(text), index + 1)),
-            b'\\' if index + 1 < content.len() => {
-                index += 1;
-                text.push(match content[index] {
-                    b'n' => '\n',
-                    b'r' => '\r',
-                    b't' => '\t',
-                    other => other as char,
-                });
-                index += 1;
-            }
-            byte => {
-                text.push(byte as char);
-                index += 1;
-            }
-        }
-    }
-    None
-}
-
-fn read_hex_or_dict(content: &[u8], start: usize) -> Option<(Token, usize)> {
-    if content.get(start + 1) == Some(&b'<') {
-        let end = content[start + 2..].windows(2).position(|pair| pair == b">>")? + start + 4;
-        return Some((Token::Op("dict".into()), end));
-    }
-    let end = content[start + 1..].iter().position(|byte| *byte == b'>')? + start + 2;
-    Some((Token::Str(String::new()), end))
-}
-
-fn read_array(content: &[u8], start: usize) -> Option<(Token, usize)> {
-    let mut items = Vec::new();
-    let mut index = start + 1;
-    while index < content.len() {
-        if content[index] == b']' {
-            return Some((Token::Array(items), index + 1));
-        }
-        if let Some((token, next)) = read_token(content, index) {
-            if next == index {
-                return None;
-            }
-            items.push(token);
-            index = next;
-        } else {
-            index += 1;
-        }
-    }
-    None
-}
-
-fn read_name(content: &[u8], start: usize) -> Option<(Token, usize)> {
-    let mut index = start + 1;
-    while index < content.len() && is_regular(content[index]) {
-        index += 1;
-    }
-    let name = String::from_utf8_lossy(&content[start + 1..index]).into_owned();
-    Some((Token::Name(name), index))
-}
-
-fn read_number(content: &[u8], start: usize) -> Option<(Token, usize)> {
-    let mut index = start + 1;
-    while index < content.len() && matches!(content[index], b'0'..=b'9' | b'.') {
-        index += 1;
-    }
-    let text = std::str::from_utf8(&content[start..index]).ok()?;
-    let value = text.parse().ok()?;
-    Some((Token::Num(value), index))
-}
-
-fn read_op(content: &[u8], start: usize) -> Option<(Token, usize)> {
-    let mut index = start + 1;
-    while index < content.len() && is_regular(content[index]) {
-        index += 1;
-    }
-    let op = String::from_utf8_lossy(&content[start..index]).into_owned();
-    Some((Token::Op(op), index))
-}
-
-fn is_regular(byte: u8) -> bool {
-    !byte.is_ascii_whitespace()
-        && !matches!(byte, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+fn page_info(bytes: &[u8]) -> PageInfo {
+    let Ok(document) = Document::load_mem(bytes) else {
+        return PageInfo {
+            count: 0,
+            sizes: Vec::new(),
+        };
+    };
+    let pages = document.get_pages();
+    let sizes = pages
+        .into_iter()
+        .map(|(_number, page_id)| page_box(&document, page_id).unwrap_or((612.0, 792.0)))
+        .collect::<Vec<_>>();
+    let count = sizes.len() as u32;
+    PageInfo { count, sizes }
 }
 
 fn page_box(document: &Document, page_id: ObjectId) -> Option<(f64, f64)> {
@@ -364,68 +235,41 @@ fn number(object: &Object) -> Option<f64> {
     }
 }
 
-fn page_content(document: &Document, page_id: ObjectId) -> Option<Vec<u8>> {
-    let Object::Dictionary(dict) = document.get_object(page_id).ok()? else {
-        return None;
-    };
-    stream_bytes(document, dict.get(b"Contents").ok()?)
-}
-
-fn stream_bytes(document: &Document, object: &Object) -> Option<Vec<u8>> {
-    match object {
-        Object::Stream(stream) => stream.decompressed_content().ok(),
-        Object::Reference(id) => match document.get_object(*id).ok()? {
-            Object::Stream(stream) => stream.decompressed_content().ok(),
-            Object::Array(items) => {
-                let mut bytes = Vec::new();
-                for item in items {
-                    bytes.extend(stream_bytes(document, item)?);
-                    bytes.push(b'\n');
-                }
-                Some(bytes)
-            }
-            _ => None,
-        },
-        Object::Array(items) => {
-            let mut bytes = Vec::new();
-            for item in items {
-                bytes.extend(stream_bytes(document, item)?);
-                bytes.push(b'\n');
-            }
-            Some(bytes)
-        }
-        _ => None,
+fn map_pdf(error: PdfError) -> ParseError {
+    match error {
+        PdfError::Encrypted => ParseError::InvalidRequest("document is encrypted".into()),
+        PdfError::NotAPdf(detail) => ParseError::InvalidRequest(detail),
+        other => ParseError::Unavailable(other.to_string()),
     }
 }
 
 #[cfg(test)]
 pub(crate) fn fixture_hello_pdf() -> Vec<u8> {
+    fixture_pdf(b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET")
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_pdf(content: &[u8]) -> Vec<u8> {
     let mut document = Document::with_version("1.4");
     let pages_id = document.new_object_id();
-    let font_id = document.add_object(
-        lopdf::dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Helvetica"
-        },
-    );
-    let content_id = document.add_object(lopdf::Stream::new(
-        lopdf::dictionary! {},
-        b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET".to_vec(),
-    ));
-    let page_id = document.add_object(
-        lopdf::dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            "Contents" => content_id,
-            "Resources" => lopdf::dictionary! {
-                "Font" => lopdf::dictionary! {
-                    "F1" => font_id
-                }
+    let font_id = document.add_object(lopdf::dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica"
+    });
+    let content_id =
+        document.add_object(lopdf::Stream::new(lopdf::dictionary! {}, content.to_vec()));
+    let page_id = document.add_object(lopdf::dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content_id,
+        "Resources" => lopdf::dictionary! {
+            "Font" => lopdf::dictionary! {
+                "F1" => font_id
             }
-        },
-    );
+        }
+    });
     document.objects.insert(
         pages_id,
         Object::Dictionary(lopdf::dictionary! {
@@ -434,14 +278,31 @@ pub(crate) fn fixture_hello_pdf() -> Vec<u8> {
             "Count" => 1
         }),
     );
-    let catalog_id = document.add_object(
-        lopdf::dictionary! {
-            "Type" => "Catalog",
-            "Pages" => pages_id
-        },
-    );
+    let catalog_id = document.add_object(lopdf::dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id
+    });
     document.trailer.set("Root", catalog_id);
     let mut bytes = Vec::new();
     document.save_to(&mut bytes).expect("fixture pdf");
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_runs_on_one_baseline_become_one_block() {
+        let bytes = fixture_pdf(b"BT /F1 12 Tf 72 720 Td (Hel) Tj 30 0 Td (lo) Tj ET");
+        let document = decode(&bytes).unwrap();
+        assert_eq!(document.parser, "pdf-text/2");
+        assert_eq!(document.pages[0].blocks.len(), 1);
+        assert!(document.pages[0].blocks[0].text.contains("Hel"));
+        assert!(document.pages[0].blocks[0].text.contains("lo"));
+        assert!(document.pages[0].blocks[0].spans.len() >= 2);
+        assert!(document.pages[0].blocks[0].spans.iter().all(|span| {
+            span.anchors[0].kind == AnchorKind::PageBox && span.anchors[0].bbox.is_some()
+        }));
+    }
 }

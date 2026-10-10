@@ -10,9 +10,7 @@ const MAX_WINDOW: u32 = 20;
 
 pub(crate) fn parse_document(request: &ParseRequest) -> Result<ParseDocument, ParseError> {
     if request.bytes.len() > 32 * 1024 * 1024 {
-        return Err(ParseError::InvalidRequest(
-            "document exceeds 32MiB".into(),
-        ));
+        return Err(ParseError::InvalidRequest("document exceeds 32MiB".into()));
     }
     if request.mode == ParseMode::Ocr {
         return Err(ParseError::NeedsOcr);
@@ -32,11 +30,7 @@ pub(crate) fn parse_document(request: &ParseRequest) -> Result<ParseDocument, Pa
     let include_discarded = request.outputs.contains(&OutputKind::Discarded);
     let (blocks, discarded, spans, markdown, markdown_map, discarded_count, pages_failed) =
         project(&raw, start, window_end, include_spans, include_discarded);
-    let to_page = if window_end == 0 {
-        0
-    } else {
-        window_end - 1
-    };
+    let to_page = if window_end == 0 { 0 } else { window_end - 1 };
     Ok(ParseDocument {
         media_type: media,
         parser: raw.parser,
@@ -65,9 +59,9 @@ fn page_window(spec: Option<&str>) -> Result<(u32, u32), ParseError> {
     let Some(spec) = spec.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok((0, MAX_WINDOW));
     };
-    let (left, right) = spec.split_once('-').ok_or_else(|| {
-        ParseError::InvalidRequest("pages must look like 1-20".into())
-    })?;
+    let (left, right) = spec
+        .split_once('-')
+        .ok_or_else(|| ParseError::InvalidRequest("pages must look like 1-20".into()))?;
     let start: u32 = left
         .trim()
         .parse()
@@ -127,7 +121,11 @@ fn project(
     let mut markdown = String::new();
     let mut markdown_map = Vec::new();
     for (index, block) in kept.into_iter().enumerate() {
-        let page_idx = block.anchors.first().map(|anchor| anchor.page_idx).unwrap_or(0);
+        let page_idx = block
+            .anchors
+            .first()
+            .map(|anchor| anchor.page_idx)
+            .unwrap_or(0);
         let id = format!("p{page_idx}-b{index}");
         if include_spans && spans.len() < MAX_SPANS {
             for (line, span) in block.spans.iter().enumerate() {
@@ -322,14 +320,20 @@ mod tests {
     fn ocr_mode_is_refused() {
         let mut request = ParseRequest::new(b"hello".to_vec());
         request.mode = ParseMode::Ocr;
-        assert!(matches!(parse_document(&request), Err(ParseError::NeedsOcr)));
+        assert!(matches!(
+            parse_document(&request),
+            Err(ParseError::NeedsOcr)
+        ));
     }
 
     #[test]
     fn a_png_needs_ocr() {
         let mut request = ParseRequest::new(vec![0x89, b'P', b'N', b'G', 0, 0, 0, 0]);
         request.media_type = Some("image/png".into());
-        assert!(matches!(parse_document(&request), Err(ParseError::NeedsOcr)));
+        assert!(matches!(
+            parse_document(&request),
+            Err(ParseError::NeedsOcr)
+        ));
     }
 
     #[test]
