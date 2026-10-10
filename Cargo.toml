@@ -1,0 +1,25 @@
+[workspace]
+members = []
+
+[package]
+name = "a3s-parse"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["A3S Lab Team"]
+description = "Document structure service with page anchors for A3S OS"
+
+[[bin]]
+name = "a3s-parse"
+path = "src/main.rs"
+
+[dependencies]
+lopdf = "0.42"
+quick-xml = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = "2"
