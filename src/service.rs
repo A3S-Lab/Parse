@@ -53,6 +53,7 @@ pub(crate) fn parse_multipart(
         let (name, value) = part.trim().split_once('=')?;
         name.eq_ignore_ascii_case("boundary")
             .then(|| value.trim().trim_matches('"').to_string())
+            .filter(|value| !value.is_empty())
     });
     let Some(boundary) = boundary else {
         return Err(reply(400, "INVALID_REQUEST", "file must be multipart"));
@@ -125,11 +126,16 @@ pub(crate) fn parse_multipart(
 
 fn split_parts(body: &[u8], boundary: &str) -> Vec<(String, Vec<u8>)> {
     let marker = format!("--{boundary}");
-    let text_marker = marker.as_bytes();
+    let marker = marker.as_bytes();
+    let mut delimiter = Vec::with_capacity(marker.len() + 2);
+    delimiter.extend_from_slice(b"\r\n");
+    delimiter.extend_from_slice(marker);
+    let Some(mut rest) = align_to_boundary(body, marker, &delimiter) else {
+        return Vec::new();
+    };
     let mut parts = Vec::new();
-    let mut rest = body;
-    while let Some(start) = find_subsequence(rest, text_marker) {
-        let after = &rest[start + text_marker.len()..];
+    while rest.starts_with(marker) {
+        let after = &rest[marker.len()..];
         if after.starts_with(b"--") {
             break;
         }
@@ -139,17 +145,24 @@ fn split_parts(body: &[u8], boundary: &str) -> Vec<(String, Vec<u8>)> {
         };
         let headers = String::from_utf8_lossy(&after[..header_end]);
         let content = &after[header_end + 4..];
-        let next = find_subsequence(content, text_marker).unwrap_or(content.len());
-        let mut value = content[..next].to_vec();
-        if value.ends_with(b"\r\n") {
-            value.truncate(value.len() - 2);
-        }
+        let Some(next) = find_subsequence(content, &delimiter) else {
+            break;
+        };
+        let value = content[..next].to_vec();
         if let Some(name) = disposition_name(&headers) {
             parts.push((name, value));
         }
-        rest = &content[next..];
+        rest = &content[next + 2..];
     }
     parts
+}
+
+fn align_to_boundary<'a>(body: &'a [u8], marker: &[u8], delimiter: &[u8]) -> Option<&'a [u8]> {
+    if body.starts_with(marker) {
+        Some(body)
+    } else {
+        find_subsequence(body, delimiter).map(|offset| &body[offset + 2..])
+    }
 }
 
 fn disposition_name(headers: &str) -> Option<String> {
@@ -241,6 +254,27 @@ fn anchor_json(anchor: &crate::model::Anchor) -> Value {
         "space": anchor.bbox.as_ref().map(|_| "norm-1000"),
         "part": anchor.part,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_may_contain_the_boundary_token() {
+        let body = "\
+--bound\r\n\
+Content-Disposition: form-data; name=\"file\"\r\n\
+\r\n\
+hello--boundmore\r\n\
+--bound--\r\n";
+        let incoming = match parse_multipart("multipart/form-data; boundary=bound", body.as_bytes())
+        {
+            Ok(incoming) => incoming,
+            Err(_) => panic!("multipart file should parse"),
+        };
+        assert_eq!(incoming.request.bytes, b"hello--boundmore");
+    }
 }
 
 pub(crate) async fn run_parse(request: ParseRequest) -> Result<ParseDocument, ParseError> {

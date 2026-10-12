@@ -6,7 +6,7 @@ pub(crate) fn decode(bytes: &[u8]) -> RawDocument {
     let mut blocks = Vec::new();
     let mut paragraph = String::new();
     let mut index = 0usize;
-    let mut chars = html.chars().peekable();
+    let mut chars = html.chars();
     while let Some(ch) = chars.next() {
         if ch == '<' {
             let mut tag = String::new();

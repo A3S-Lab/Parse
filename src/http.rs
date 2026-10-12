@@ -63,12 +63,30 @@ pub(crate) async fn serve_on(
 }
 
 async fn handle_connection(mut stream: TcpStream, api_key: Option<String>) -> std::io::Result<()> {
-    let received = match read_http(&mut stream).await? {
-        Some(received) => received,
-        None => return Ok(()),
+    let received = match read_http(&mut stream).await {
+        Ok(Some(received)) => received,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            if let Some(message) = body_refusal(&error) {
+                return write_json(&mut stream, &reply(400, "INVALID_REQUEST", message)).await;
+            }
+            return Err(error);
+        }
     };
     let reply = dispatch(&received, api_key.as_deref()).await;
     write_json(&mut stream, &reply).await
+}
+
+fn body_refusal(error: &std::io::Error) -> Option<&'static str> {
+    match error.to_string().as_str() {
+        "parse body is incomplete" => Some("parse body is incomplete"),
+        "parse body is malformed" => Some("parse body is malformed"),
+        _ => None,
+    }
+}
+
+fn route_path(path: &str) -> &str {
+    path.split(['?', '#']).next().unwrap_or(path)
 }
 
 struct Received {
@@ -79,7 +97,7 @@ struct Received {
 }
 
 async fn dispatch(received: &Received, api_key: Option<&str>) -> ParseReply {
-    match (received.method.as_str(), received.path.as_str()) {
+    match (received.method.as_str(), route_path(&received.path)) {
         ("GET", "/health") => ParseReply::Json {
             status: 200,
             body: serde_json::json!({"status": "ok"}),
@@ -187,13 +205,59 @@ async fn read_http(stream: &mut TcpStream) -> std::io::Result<Option<Received>> 
     let Some(path) = parts.next() else {
         return Ok(None);
     };
-    let content_length = header_text.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse::<usize>().ok())
-            .flatten()
-    });
-    let length = content_length.unwrap_or(0);
+    let body = if transfer_encoding_is_chunked(&header_text)? {
+        read_chunked_body(stream, &buffer[header_end..], &mut chunk).await?
+    } else {
+        read_length_body(stream, &mut buffer, header_end, &header_text, &mut chunk).await?
+    };
+    Ok(Some(Received {
+        method: method.to_string(),
+        path: path.to_string(),
+        headers: header_text,
+        body,
+    }))
+}
+
+fn transfer_encoding_is_chunked(headers: &str) -> std::io::Result<bool> {
+    let Some(value) = header_value(headers, "transfer-encoding") else {
+        return Ok(false);
+    };
+    let codings: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if codings
+        .last()
+        .is_some_and(|part| part.eq_ignore_ascii_case("chunked"))
+        && codings
+            .iter()
+            .all(|part| part.eq_ignore_ascii_case("chunked"))
+    {
+        return Ok(true);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "parse body is malformed",
+    ))
+}
+
+async fn read_length_body(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    header_end: usize,
+    header_text: &str,
+    chunk: &mut [u8],
+) -> std::io::Result<Vec<u8>> {
+    let length = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
     if length > MAX_BODY_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -201,7 +265,7 @@ async fn read_http(stream: &mut TcpStream) -> std::io::Result<Option<Received>> 
         ));
     }
     while buffer.len() < header_end + length {
-        let read = stream.read(&mut chunk).await?;
+        let read = stream.read(chunk).await?;
         if read == 0 {
             break;
         }
@@ -213,13 +277,147 @@ async fn read_http(stream: &mut TcpStream) -> std::io::Result<Option<Received>> 
             ));
         }
     }
-    let body_end = (header_end + length).min(buffer.len());
-    Ok(Some(Received {
-        method: method.to_string(),
-        path: path.to_string(),
-        headers: header_text,
-        body: buffer[header_end..body_end].to_vec(),
-    }))
+    if buffer.len() < header_end + length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "parse body is incomplete",
+        ));
+    }
+    Ok(buffer[header_end..header_end + length].to_vec())
+}
+
+async fn read_chunked_body(
+    stream: &mut TcpStream,
+    already: &[u8],
+    chunk: &mut [u8],
+) -> std::io::Result<Vec<u8>> {
+    let mut decoder = ChunkDecoder::default();
+    if decoder.feed(already)? {
+        return Ok(decoder.body);
+    }
+    loop {
+        let read = stream.read(chunk).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "parse body is incomplete",
+            ));
+        }
+        if decoder.feed(&chunk[..read])? {
+            return Ok(decoder.body);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChunkDecoder {
+    body: Vec<u8>,
+    carry: Vec<u8>,
+    expecting: ChunkExpect,
+}
+
+#[derive(Default)]
+enum ChunkExpect {
+    #[default]
+    Size,
+    Data(usize),
+    DataCr,
+    DataLf,
+    Trailers,
+}
+
+impl ChunkDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> std::io::Result<bool> {
+        self.carry.extend_from_slice(bytes);
+        loop {
+            match self.expecting {
+                ChunkExpect::Size => {
+                    let Some(end) = find_crlf(&self.carry) else {
+                        if self.carry.len() > 64 {
+                            return Err(malformed());
+                        }
+                        return Ok(false);
+                    };
+                    let line = &self.carry[..end];
+                    let size_bytes = line.split(|byte| *byte == b';').next().unwrap_or(line);
+                    let size_text = std::str::from_utf8(size_bytes).map_err(|_| malformed())?;
+                    let size =
+                        usize::from_str_radix(size_text.trim(), 16).map_err(|_| malformed())?;
+                    if self.body.len().saturating_add(size) > MAX_BODY_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "parse body exceeds 32MiB",
+                        ));
+                    }
+                    self.carry.drain(..end + 2);
+                    self.expecting = if size == 0 {
+                        ChunkExpect::Trailers
+                    } else {
+                        ChunkExpect::Data(size)
+                    };
+                }
+                ChunkExpect::Data(left) => {
+                    if self.carry.len() < left {
+                        return Ok(false);
+                    }
+                    self.body.extend_from_slice(&self.carry[..left]);
+                    self.carry.drain(..left);
+                    self.expecting = ChunkExpect::DataCr;
+                }
+                ChunkExpect::DataCr => {
+                    if self.carry.is_empty() {
+                        return Ok(false);
+                    }
+                    if self.carry[0] != b'\r' {
+                        return Err(malformed());
+                    }
+                    self.carry.drain(..1);
+                    self.expecting = ChunkExpect::DataLf;
+                }
+                ChunkExpect::DataLf => {
+                    if self.carry.is_empty() {
+                        return Ok(false);
+                    }
+                    if self.carry[0] != b'\n' {
+                        return Err(malformed());
+                    }
+                    self.carry.drain(..1);
+                    self.expecting = ChunkExpect::Size;
+                }
+                ChunkExpect::Trailers => {
+                    let Some(end) = find_crlf(&self.carry) else {
+                        if self.carry.len() > 8 * 1024 {
+                            return Err(malformed());
+                        }
+                        return Ok(false);
+                    };
+                    let blank = end == 0;
+                    self.carry.drain(..end + 2);
+                    if blank {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn find_crlf(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|window| window == b"\r\n")
+}
+
+fn malformed() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "parse body is malformed")
+}
+
+fn billed_pages(body: &serde_json::Value) -> Option<u64> {
+    let page_count = body.pointer("/data/document/page_count")?.as_u64()?;
+    let from = body.pointer("/data/document/pages/from")?.as_u64()?;
+    let to = body.pointer("/data/document/pages/to")?.as_u64()?;
+    if page_count == 0 || to < from {
+        return Some(0);
+    }
+    to.checked_sub(from)?.checked_add(1)
 }
 
 fn find_headers_end(buffer: &[u8]) -> Option<usize> {
@@ -231,10 +429,14 @@ fn find_headers_end(buffer: &[u8]) -> Option<usize> {
 
 async fn write_json(stream: &mut TcpStream, reply: &ParseReply) -> std::io::Result<()> {
     let ParseReply::Json { status, body } = reply;
-    let payload = serde_json::to_vec(body).unwrap_or_else(|_| {
-        br#"{"success":false,"error":"parse response could not be encoded","code":"UNAVAILABLE"}"#
-            .to_vec()
-    });
+    let (status, payload) = match serde_json::to_vec(body) {
+        Ok(payload) => (*status, payload),
+        Err(_) => (
+            503,
+            br#"{"success":false,"error":"parse response could not be encoded","code":"UNAVAILABLE"}"#
+                .to_vec(),
+        ),
+    };
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -244,8 +446,13 @@ async fn write_json(stream: &mut TcpStream, reply: &ParseReply) -> std::io::Resu
         422 => "Unprocessable Entity",
         _ => "Service Unavailable",
     };
+    let usage = (status == 200)
+        .then(|| billed_pages(body))
+        .flatten()
+        .map(|pages| format!("x-a3s-usage-quantity: {pages}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{usage}Content-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     stream.write_all(head.as_bytes()).await?;
@@ -256,6 +463,22 @@ async fn write_json(stream: &mut TcpStream, reply: &ParseReply) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_past_the_document_bills_zero_pages() {
+        let past = serde_json::json!({
+            "data": { "document": { "page_count": 3, "pages": { "from": 9, "to": 2 } } }
+        });
+        assert_eq!(billed_pages(&past), Some(0));
+        let empty = serde_json::json!({
+            "data": { "document": { "page_count": 0, "pages": { "from": 0, "to": 0 } } }
+        });
+        assert_eq!(billed_pages(&empty), Some(0));
+        let one = serde_json::json!({
+            "data": { "document": { "page_count": 1, "pages": { "from": 0, "to": 0 } } }
+        });
+        assert_eq!(billed_pages(&one), Some(1));
+    }
 
     #[test]
     fn a_public_bind_needs_a_key() {
@@ -322,6 +545,82 @@ mod tests {
         assert!(text.contains("200"), "{text}");
         assert!(text.contains("Hello"), "{text}");
         assert!(!text.contains("/tmp"), "{text}");
+
+        let queried = http_bytes(
+            "POST",
+            &address,
+            "/v1/parse?trace=1",
+            Some("Bearer deployment-secret"),
+            "multipart/form-data; boundary=bound",
+            b"--bound\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nHello\r\n--bound--\r\n",
+        )
+        .await;
+        assert!(queried.contains("200"), "{queried}");
+        assert!(queried.contains("x-a3s-usage-quantity:"), "{queried}");
+    }
+
+    #[test]
+    fn a_chunked_body_decodes_and_a_partial_chunk_does_not() {
+        let mut decoder = ChunkDecoder::default();
+        assert!(!decoder.feed(b"5\r\nHel").unwrap());
+        assert!(decoder.feed(b"lo\r\n0\r\n\r\n").unwrap());
+        assert_eq!(decoder.body, b"Hello");
+        let mut split = ChunkDecoder::default();
+        assert!(split.feed(b"2\r\nHe\r\n3\r\nllo\r\n0\r\n\r\n").unwrap());
+        assert_eq!(split.body, b"Hello");
+        let mut bad = ChunkDecoder::default();
+        assert!(bad.feed(b"zz\r\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_chunked_parse_request_is_billed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_on(listener, Some("deployment-secret".to_string())));
+        let payload = b"--bound\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nHello\r\n--bound--\r\n";
+        let mut body = format!("{:x}\r\n", payload.len()).into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let head = format!(
+            "POST /v1/parse HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer deployment-secret\r\nContent-Type: multipart/form-data; boundary=bound\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        stream
+            .shutdown()
+            .await
+            .expect("test client closes the upload");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("200"), "{text}");
+        assert!(text.contains("Hello"), "{text}");
+        assert!(text.contains("x-a3s-usage-quantity: 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_body_is_rejected_without_a_usage_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_on(listener, Some("deployment-secret".to_string())));
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let body = b"Hello";
+        let request = format!(
+            "POST /v1/parse HTTP/1.1\r\nHost: {address}\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream
+            .shutdown()
+            .await
+            .expect("test client closes the upload");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("400"), "{text}");
+        assert!(text.contains("incomplete"), "{text}");
+        assert!(!text.contains("x-a3s-usage-quantity"), "{text}");
     }
 
     async fn multipart(

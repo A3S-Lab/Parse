@@ -4,9 +4,9 @@ use crate::model::{
     Block, MarkdownSpan, OutputKind, PageFailure, ParseDocument, ParseMode, ParseRequest, Span,
 };
 
-const MARKDOWN_BYTES: usize = 64 * 1024;
+const MARKDOWN_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SPANS: usize = 2000;
-const MAX_WINDOW: u32 = 20;
+const MAX_WINDOW: u32 = 500;
 
 pub(crate) fn parse_document(request: &ParseRequest) -> Result<ParseDocument, ParseError> {
     if request.bytes.len() > 32 * 1024 * 1024 {
@@ -24,13 +24,35 @@ pub(crate) fn parse_document(request: &ParseRequest) -> Result<ParseDocument, Pa
     let page_count = raw.page_count.max(raw.pages.len() as u32);
     raw.page_count = page_count;
     let window_end = end.min(page_count);
-    let truncated = window_end < page_count || end < page_count;
-    let next_page = truncated.then_some(window_end + 1);
     let include_spans = request.outputs.contains(&OutputKind::Spans);
     let include_discarded = request.outputs.contains(&OutputKind::Discarded);
-    let (blocks, discarded, spans, markdown, markdown_map, discarded_count, pages_failed) =
-        project(&raw, start, window_end, include_spans, include_discarded);
-    let to_page = if window_end == 0 { 0 } else { window_end - 1 };
+    let (
+        blocks,
+        discarded,
+        spans,
+        markdown,
+        markdown_map,
+        discarded_count,
+        pages_failed,
+        budget_resume,
+    ) = project(&raw, start, window_end, include_spans, include_discarded);
+    let (to_exclusive, truncated, next_page) = match budget_resume {
+        Some(resume) => (
+            resume.covered_end,
+            true,
+            (resume.next_page < raw.page_count).then_some(resume.next_page + 1),
+        ),
+        None => (
+            window_end,
+            window_end < page_count || end < page_count,
+            (window_end < page_count || end < page_count).then_some(window_end + 1),
+        ),
+    };
+    let to_page = if to_exclusive == 0 {
+        0
+    } else {
+        to_exclusive - 1
+    };
     Ok(ParseDocument {
         media_type: media,
         parser: raw.parser,
@@ -49,7 +71,7 @@ pub(crate) fn parse_document(request: &ParseRequest) -> Result<ParseDocument, Pa
         page_geom: raw
             .pages
             .iter()
-            .filter(|page| page.page_idx >= start && page.page_idx < window_end)
+            .filter(|page| page.page_idx >= start && page.page_idx < to_exclusive)
             .map(|page| page.geom.clone())
             .collect(),
     })
@@ -61,21 +83,26 @@ fn page_window(spec: Option<&str>) -> Result<(u32, u32), ParseError> {
     };
     let (left, right) = spec
         .split_once('-')
-        .ok_or_else(|| ParseError::InvalidRequest("pages must look like 1-20".into()))?;
+        .ok_or_else(|| ParseError::InvalidRequest("pages must look like 1-10".into()))?;
     let start: u32 = left
         .trim()
         .parse()
-        .map_err(|_| ParseError::InvalidRequest("pages must look like 1-20".into()))?;
+        .map_err(|_| ParseError::InvalidRequest("pages must look like 1-10".into()))?;
     let end: u32 = right
         .trim()
         .parse()
-        .map_err(|_| ParseError::InvalidRequest("pages must look like 1-20".into()))?;
+        .map_err(|_| ParseError::InvalidRequest("pages must look like 1-10".into()))?;
     if start == 0 || end < start || end - start + 1 > MAX_WINDOW {
-        return Err(ParseError::InvalidRequest(
-            "pages must be a 1-based window of at most 20 pages".into(),
-        ));
+        return Err(ParseError::InvalidRequest(format!(
+            "pages must be a 1-based window of at most {MAX_WINDOW} pages"
+        )));
     }
     Ok((start - 1, end))
+}
+
+struct BudgetResume {
+    covered_end: u32,
+    next_page: u32,
 }
 
 fn project(
@@ -92,6 +119,7 @@ fn project(
     Vec<MarkdownSpan>,
     u32,
     Vec<PageFailure>,
+    Option<BudgetResume>,
 ) {
     let mut kept = Vec::new();
     let mut discarded_raw = Vec::new();
@@ -115,19 +143,22 @@ fn project(
         }
     }
     let kept = merge_tables(kept);
-    let discarded_count = discarded_raw.len() as u32;
     let mut blocks = Vec::new();
     let mut spans = Vec::new();
     let mut markdown = String::new();
     let mut markdown_map = Vec::new();
-    for (index, block) in kept.into_iter().enumerate() {
+    let mut budget_resume = None;
+    let mut last_included = None;
+    for (index, block) in kept.iter().enumerate() {
         let page_idx = block
             .anchors
             .first()
             .map(|anchor| anchor.page_idx)
             .unwrap_or(0);
         let id = format!("p{page_idx}-b{index}");
-        if include_spans && spans.len() < MAX_SPANS {
+        let index = index as u32;
+        let mut stored_spans = 0_usize;
+        if include_spans {
             for (line, span) in block.spans.iter().enumerate() {
                 if spans.len() >= MAX_SPANS {
                     break;
@@ -141,36 +172,85 @@ fn project(
                     anchors: span.anchors.clone(),
                     confidence: span.confidence,
                 });
+                stored_spans += 1;
             }
         }
+        let before_separator = markdown.len();
         if !markdown.is_empty() && markdown.len() + 2 <= MARKDOWN_BYTES {
             markdown.push_str("\n\n");
         }
         let text_start = markdown.chars().count();
-        push_bounded(&mut markdown, &block.text);
-        let text_end = markdown.chars().count();
-        markdown_map.push(MarkdownSpan {
-            start: text_start,
-            end: text_end,
-            block_id: id.clone(),
-        });
-        let stop = markdown.len() >= MARKDOWN_BYTES;
+        let text_fit = push_bounded(&mut markdown, &block.text);
+        let written_chars = markdown.chars().count() - text_start;
+        if !text_fit && text_start > 0 {
+            spans.retain(|span| span.block_id != id);
+            markdown.truncate(before_separator);
+            budget_resume = Some(BudgetResume {
+                covered_end: last_included.map(|page| page + 1).unwrap_or(start),
+                next_page: page_idx,
+            });
+            break;
+        }
+        let text = if text_fit {
+            block.text.clone()
+        } else {
+            block.text.chars().take(written_chars).collect()
+        };
+        if written_chars > 0 {
+            markdown_map.push(MarkdownSpan {
+                start: text_start,
+                end: text_start + written_chars,
+                block_id: id.clone(),
+            });
+        }
+        let spans_cut = include_spans && stored_spans < block.spans.len();
+        let later_spans = include_spans
+            && spans.len() >= MAX_SPANS
+            && kept[index as usize + 1..]
+                .iter()
+                .any(|later| !later.spans.is_empty());
+        let next_page_idx = kept
+            .get(index as usize + 1)
+            .and_then(|later| later.anchors.first().map(|anchor| anchor.page_idx));
         blocks.push(Block {
             id,
-            order: index as u32,
+            order: index,
             block_type: block.block_type,
-            text: block.text,
+            text,
             text_level: block.text_level,
-            parent_id: None,
-            anchors: block.anchors,
+            anchors: block.anchors.clone(),
             unanchored: block.unanchored,
         });
-        if stop {
+        last_included = Some(page_idx);
+        let more = index as usize + 1 < kept.len();
+        if !text_fit || spans_cut || later_spans || (markdown.len() >= MARKDOWN_BYTES && more) {
+            let complete = text_fit && !spans_cut;
+            let next_page = if complete {
+                next_page_idx
+                    .filter(|page| *page > page_idx)
+                    .unwrap_or(page_idx + 1)
+            } else {
+                page_idx + 1
+            };
+            budget_resume = Some(BudgetResume {
+                covered_end: page_idx + 1,
+                next_page,
+            });
             break;
         }
     }
-    // Drop a map entry whose text was cut off past the markdown budget.
-    markdown_map.retain(|item| item.end <= markdown.chars().count());
+    if let Some(resume) = &budget_resume {
+        pages_failed.retain(|failure| failure.page_idx < resume.covered_end);
+        discarded_raw.retain(|block| {
+            block
+                .anchors
+                .first()
+                .map(|anchor| anchor.page_idx)
+                .unwrap_or(0)
+                < resume.covered_end
+        });
+    }
+    let discarded_count = discarded_raw.len() as u32;
     let discarded = if include_discarded {
         discarded_raw
             .into_iter()
@@ -181,7 +261,6 @@ fn project(
                 block_type: block.block_type,
                 text: block.text,
                 text_level: None,
-                parent_id: None,
                 anchors: block.anchors,
                 unanchored: block.unanchored,
             })
@@ -197,17 +276,19 @@ fn project(
         markdown_map,
         discarded_count,
         pages_failed,
+        budget_resume,
     )
 }
 
-fn push_bounded(markdown: &mut String, text: &str) {
+fn push_bounded(markdown: &mut String, text: &str) -> bool {
     for ch in text.chars() {
         let next = markdown.len() + ch.len_utf8();
         if next > MARKDOWN_BYTES {
-            return;
+            return false;
         }
         markdown.push(ch);
     }
+    true
 }
 
 fn merge_tables(blocks: Vec<RawBlock>) -> Vec<RawBlock> {
@@ -296,6 +377,62 @@ mod tests {
             .join("\n\n");
         let document = parse(&text);
         assert_eq!(document.spans.len(), 2000);
+    }
+
+    #[test]
+    fn a_markdown_budget_names_the_next_page() {
+        let page = "a".repeat(1024 * 1024);
+        let text = format!("{page}\u{000c}{page}\u{000c}{page}");
+        let mut request = ParseRequest::new(text.into_bytes());
+        request.media_type = Some("text/plain".into());
+        let document = parse_document(&request).unwrap();
+        assert!(document.truncated);
+        assert_eq!(document.from_page, 0);
+        assert_eq!(document.to_page, 0);
+        assert_eq!(document.next_page, Some(2));
+        assert_eq!(document.markdown.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn a_page_larger_than_the_markdown_budget_keeps_only_the_prefix() {
+        let page = "b".repeat(2 * 1024 * 1024 + 32);
+        let text = format!("{page}\u{000c}tail");
+        let mut request = ParseRequest::new(text.into_bytes());
+        request.media_type = Some("text/plain".into());
+        let document = parse_document(&request).unwrap();
+        assert!(document.truncated);
+        assert_eq!(document.to_page, 0);
+        assert_eq!(document.next_page, Some(2));
+        assert!(document.markdown.len() <= 2 * 1024 * 1024);
+        assert_eq!(document.blocks.len(), 1);
+        assert_eq!(document.blocks[0].text, document.markdown);
+        assert!(document.markdown.len() < page.len());
+    }
+
+    #[test]
+    fn a_document_past_twenty_pages_parses_in_one_window() {
+        let text = (0..40)
+            .map(|index| format!("page {index}"))
+            .collect::<Vec<_>>()
+            .join("\u{000c}");
+        let mut request = ParseRequest::new(text.into_bytes());
+        request.media_type = Some("text/plain".into());
+        let document = parse_document(&request).unwrap();
+        assert_eq!(document.page_count, 40);
+        assert!(!document.truncated);
+        assert!(document.next_page.is_none());
+    }
+
+    #[test]
+    fn a_window_above_five_hundred_pages_is_rejected() {
+        let mut request = ParseRequest::new(b"hello".to_vec());
+        request.pages = Some("1-501".into());
+        match parse_document(&request) {
+            Err(ParseError::InvalidRequest(message)) => {
+                assert!(message.contains("500"), "{message}")
+            }
+            other => panic!("expected a window rejection, got {other:?}"),
+        }
     }
 
     #[test]

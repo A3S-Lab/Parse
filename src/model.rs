@@ -1,10 +1,8 @@
 /// How a block points back at the original document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorKind {
-    /// PDF or image box. `bbox` uses `norm-1000`, origin top-left, y down.
+    /// PDF box. `bbox` uses `norm-1000`, origin top-left, y down.
     PageBox,
-    /// Slide shape box in the same coordinate space.
-    SlideBox,
     /// Worksheet cell. `part` is `sheet:row:col`.
     Cell,
     /// Paragraph index. `part` is the index. No page box is invented.
@@ -15,7 +13,6 @@ impl AnchorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PageBox => "page-box",
-            Self::SlideBox => "slide-box",
             Self::Cell => "cell",
             Self::Paragraph => "paragraph",
         }
@@ -37,11 +34,8 @@ pub enum BlockType {
     List,
     Table,
     Image,
-    Chart,
     Equation,
     Code,
-    Header,
-    Footer,
     PageNumber,
 }
 
@@ -53,11 +47,8 @@ impl BlockType {
             Self::List => "list",
             Self::Table => "table",
             Self::Image => "image",
-            Self::Chart => "chart",
             Self::Equation => "equation",
             Self::Code => "code",
-            Self::Header => "header",
-            Self::Footer => "footer",
             Self::PageNumber => "page_number",
         }
     }
@@ -66,7 +57,6 @@ impl BlockType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanType {
     Text,
-    InlineEquation,
     InterlineEquation,
 }
 
@@ -74,7 +64,6 @@ impl SpanType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Text => "text",
-            Self::InlineEquation => "inline_equation",
             Self::InterlineEquation => "interline_equation",
         }
     }
@@ -98,7 +87,6 @@ pub struct Block {
     pub block_type: BlockType,
     pub text: String,
     pub text_level: Option<u8>,
-    pub parent_id: Option<String>,
     pub anchors: Vec<Anchor>,
     pub unanchored: bool,
 }

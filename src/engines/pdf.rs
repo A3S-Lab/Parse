@@ -31,7 +31,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawDocument, ParseError> {
         .count
         .max(by_page.keys().next_back().copied().unwrap_or(0) + 1);
     let mut pages = Vec::new();
-    let mut saw_text = false;
     for page_idx in 0..page_count {
         let (width, height) = info
             .sizes
@@ -48,16 +47,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawDocument, ParseError> {
             });
             continue;
         }
-        saw_text = true;
         pages.push(RawPage {
             page_idx,
             geom: geom(page_idx, width, height),
             failure: None,
             blocks: lines_to_blocks(runs, page_idx, width, height),
         });
-    }
-    if !saw_text {
-        return Err(ParseError::NeedsOcr);
     }
     Ok(RawDocument {
         parser: "pdf-text/2".into(),
